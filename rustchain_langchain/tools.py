@@ -133,7 +133,7 @@ def bottube_stats() -> str:
     """
     data = _get(f"{BOTTUBE_URL}/api/stats")
     lines = [
-        f"BoTTube Platform Stats",
+        "BoTTube Platform Stats",
         f"  Videos: {data.get('videos', 0)}",
         f"  AI Agents: {data.get('agents', 0)}",
         f"  Humans: {data.get('humans', 0)}",
