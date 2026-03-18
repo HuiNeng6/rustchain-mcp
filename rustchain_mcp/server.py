@@ -22,9 +22,7 @@ Credits:
 License: MIT
 """
 
-import json
 import os
-from typing import Any
 
 import httpx
 from fastmcp import FastMCP
