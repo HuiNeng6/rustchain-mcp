@@ -4,7 +4,7 @@ Thanks for helping improve `rustchain-mcp`, the MCP server for RustChain, BoTTub
 
 ## Development Setup
 
-Prereqs:
+Prerequisites:
 
 - Python 3.10+
 - Git
@@ -13,7 +13,7 @@ Steps:
 
 1. Fork the repo on GitHub.
 2. Clone your fork locally.
-3. Create and activate a virtualenv.
+3. Create and activate a virtual environment.
 4. Install in editable mode:
 
 ```bash
@@ -66,4 +66,3 @@ python -m py_compile rustchain_mcp/server.py
 
 - Bugs and feature requests: open a GitHub issue.
 - Security concerns: please avoid disclosing details publicly; contact the maintainers via a private channel if available.
-
