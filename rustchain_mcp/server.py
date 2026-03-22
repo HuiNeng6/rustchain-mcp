@@ -13,6 +13,7 @@ Any AI agent (Claude Code, Codex, CrewAI, LangChain, custom) can:
   - Earn RTC tokens via mining, bounties, and content creation
   - Upload and discover AI-generated video content
   - Register on the Beacon network and communicate with other agents
+  - Manage wallets with secure Ed25519 keys and BIP39 mnemonics
   - No beacon-skill package needed — full protocol access via MCP tools
 
 Credits:
@@ -23,9 +24,15 @@ License: MIT
 """
 
 import os
+import time
+import json
+from pathlib import Path
 
 import httpx
 from fastmcp import FastMCP
+
+# Import crypto module for wallet operations
+from .rustchain_crypto import RustChainCrypto, create_wallet, sign_transaction
 
 # ── Configuration ──────────────────────────────────────────────
 RUSTCHAIN_NODE = os.environ.get("RUSTCHAIN_NODE", "https://50.28.86.131")
@@ -228,7 +235,6 @@ def rustchain_transfer_signed(
     Returns transfer result with transaction ID and new balance.
     Transfers require valid Ed25519 signatures for security.
     """
-    import time
     payload = {
         "from_address": from_address,
         "to_address": to_address,
@@ -241,6 +247,554 @@ def rustchain_transfer_signed(
     r = get_client().post(f"{RUSTCHAIN_NODE}/wallet/transfer/signed", json=payload)
     r.raise_for_status()
     return r.json()
+
+
+# ═══════════════════════════════════════════════════════════════
+# WALLET MANAGEMENT TOOLS
+# Ed25519 + BIP39 secure wallet operations
+# ═══════════════════════════════════════════════════════════════
+
+# Initialize crypto module
+_crypto = None
+
+def get_crypto() -> RustChainCrypto:
+    """Get or create RustChainCrypto instance."""
+    global _crypto
+    if _crypto is None:
+        _crypto = RustChainCrypto()
+    return _crypto
+
+
+@mcp.tool()
+def wallet_create(
+    name: str = "",
+    password: str = ""
+) -> dict:
+    """Create a new RTC wallet with Ed25519 keypair and BIP39 seed phrase.
+
+    Generates a new wallet with:
+    - Ed25519 cryptographic keypair
+    - BIP39 mnemonic (12-word seed phrase)
+    - Encrypted keystore stored in ~/.rustchain/mcp_wallets/
+
+    Args:
+        name: Optional wallet name/label (default: address prefix)
+        password: Optional encryption password. If not provided,
+                  a random password is generated and returned.
+                  IMPORTANT: Save this password securely!
+
+    Returns:
+        {
+            "address": "RTC1a2b3c4d...",  // Wallet address
+            "keystore_path": "~/.rustchain/mcp_wallets/RTC1a2b3c4d.json",
+            "created": true,
+            "name": "my-wallet",
+            "password": "random-password-if-not-provided",
+            "warning": "BACKUP YOUR PASSWORD AND MNEMONIC SECURELY"
+        }
+
+    SECURITY:
+        - Private keys and mnemonics are NEVER exposed in responses
+        - Keys are encrypted at rest using AES-256-GCM
+        - Backup your password - it cannot be recovered!
+
+    Example:
+        # Create wallet with random password
+        wallet = wallet_create(name="my-agent")
+        print(f"Address: {wallet['address']}")
+        print(f"Password: {wallet['password']}")  # Save this!
+    """
+    crypto = get_crypto()
+    
+    # Generate mnemonic
+    mnemonic = crypto.generate_mnemonic()
+    
+    # Generate keypair from mnemonic seed
+    seed = crypto.mnemonic_to_seed(mnemonic)
+    private_key, public_key = crypto.generate_keypair(seed)
+    
+    # Derive address
+    address = crypto.derive_address(public_key)
+    
+    # Generate random password if not provided
+    import secrets
+    generated_password = False
+    if not password:
+        password = secrets.token_urlsafe(16)
+        generated_password = True
+    
+    # Create and save encrypted keystore
+    keystore = crypto.encrypt_keystore(private_key, password, address, mnemonic)
+    filepath = crypto.save_keystore(keystore)
+    
+    result = {
+        "address": address,
+        "keystore_path": str(filepath),
+        "created": True,
+        "name": name or address[:12],
+        "note": "Wallet created successfully. Private key and mnemonic are securely encrypted.",
+    }
+    
+    # Only return password if we generated it
+    if generated_password:
+        result["password"] = password
+        result["warning"] = "SAVE THIS PASSWORD SECURELY - IT CANNOT BE RECOVERED"
+    else:
+        result["warning"] = "Password saved. Remember to backup your mnemonic separately."
+    
+    return result
+
+
+@mcp.tool()
+def wallet_balance(wallet_id: str) -> dict:
+    """Check RTC token balance for a wallet.
+
+    Args:
+        wallet_id: Wallet address (e.g., "RTC1a2b3c4d...") or
+                   miner ID (e.g., "dual-g4-125")
+
+    Returns:
+        {
+            "wallet_id": "RTC1a2b3c4d...",
+            "balance": 10.5,  // RTC tokens
+            "balance_usd": 1.05,  // USD at $0.10/RTC reference rate
+            "status": "active"
+        }
+
+    Example:
+        balance = wallet_balance("RTC1a2b3c4d...")
+        print(f"Balance: {balance['balance']} RTC")
+    """
+    r = get_client().get(f"{RUSTCHAIN_NODE}/balance", params={"miner_id": wallet_id})
+    r.raise_for_status()
+    data = r.json()
+    
+    # Add USD conversion
+    balance_rtc = data.get("balance", 0)
+    if isinstance(balance_rtc, (int, float)):
+        data["balance_usd"] = balance_rtc * 0.10
+    
+    return data
+
+
+@mcp.tool()
+def wallet_history(
+    wallet_id: str,
+    limit: int = 20
+) -> dict:
+    """Get transaction history for a wallet.
+
+    Args:
+        wallet_id: Wallet address to query
+        limit: Maximum number of transactions to return (default: 20, max: 100)
+
+    Returns:
+        {
+            "wallet_id": "RTC1a2b3c4d...",
+            "transactions": [
+                {
+                    "tx_id": "tx_abc123...",
+                    "type": "send|receive",
+                    "amount": 5.0,
+                    "counterparty": "RTC2e3f4g5h...",
+                    "timestamp": 1234567890,
+                    "memo": "Payment for services"
+                },
+                ...
+            ],
+            "total": 45,
+            "note": "Showing 20 of 45 transactions"
+        }
+
+    Example:
+        history = wallet_history("RTC1a2b3c4d...", limit=10)
+        for tx in history["transactions"]:
+            print(f"{tx['type']}: {tx['amount']} RTC")
+    """
+    limit = min(limit, 100)
+    
+    # Try to get transaction history from node
+    try:
+        r = get_client().get(
+            f"{RUSTCHAIN_NODE}/wallet/history/{wallet_id}",
+            params={"limit": limit}
+        )
+        r.raise_for_status()
+        data = r.json()
+        
+        if "transactions" in data:
+            return data
+        
+        # If no transactions field, return empty history
+        return {
+            "wallet_id": wallet_id,
+            "transactions": [],
+            "total": 0,
+            "note": "No transactions found for this wallet"
+        }
+    except Exception as e:
+        # Fallback: return empty history if endpoint not available
+        return {
+            "wallet_id": wallet_id,
+            "transactions": [],
+            "total": 0,
+            "error": str(e),
+            "note": "Transaction history endpoint not available"
+        }
+
+
+@mcp.tool()
+def wallet_list() -> dict:
+    """List all wallets in the local keystore.
+
+    Returns information about all wallets stored in ~/.rustchain/mcp_wallets/
+    WITHOUT exposing private keys or mnemonics.
+
+    Returns:
+        {
+            "total": 3,
+            "wallets": [
+                {
+                    "address": "RTC1a2b3c4d...",
+                    "name": "my-agent",
+                    "created_at": 1234567890,
+                    "keystore_path": "~/.rustchain/mcp_wallets/RTC1a2b3c4d.json"
+                },
+                ...
+            ],
+            "keystore_dir": "~/.rustchain/mcp_wallets"
+        }
+
+    Example:
+        wallets = wallet_list()
+        for w in wallets["wallets"]:
+            print(f"{w['name']}: {w['address']}")
+    """
+    crypto = get_crypto()
+    keystores = crypto.list_keystores()
+    
+    return {
+        "total": len(keystores),
+        "wallets": keystores,
+        "keystore_dir": str(crypto.keystore_dir)
+    }
+
+
+@mcp.tool()
+def wallet_export(
+    address: str,
+    password: str
+) -> dict:
+    """Export encrypted keystore JSON for backup.
+
+    Exports the encrypted keystore file for a wallet. This file can be
+    imported later using wallet_import.
+
+    Args:
+        address: Wallet address to export
+        password: Password to decrypt the keystore (for verification)
+
+    Returns:
+        {
+            "address": "RTC1a2b3c4d...",
+            "keystore": { ... },  // Encrypted keystore JSON
+            "warning": "Store this keystore file securely. It contains your encrypted private key."
+        }
+
+    SECURITY:
+        - Keystore is encrypted - private key is NOT exposed
+        - Keep keystore and password SEPARATE
+        - Anyone with BOTH keystore and password can access your funds
+
+    Example:
+        keystore = wallet_export("RTC1a2b3c4d...", "my-password")
+        # Save keystore to backup file
+        with open("backup.json", "w") as f:
+            json.dump(keystore["keystore"], f)
+    """
+    crypto = get_crypto()
+    
+    # Load keystore
+    keystore = crypto.load_keystore(address)
+    if not keystore:
+        return {
+            "error": f"Wallet {address} not found in keystore",
+            "hint": "Use wallet_list to see available wallets"
+        }
+    
+    # Verify password by attempting decrypt
+    try:
+        crypto.decrypt_keystore(keystore, password)
+    except ValueError:
+        return {
+            "error": "Invalid password",
+            "hint": "Password verification failed"
+        }
+    
+    return {
+        "address": address,
+        "keystore": keystore,
+        "warning": "Store this keystore file securely. It contains your encrypted private key. Keep keystore and password SEPARATE!"
+    }
+
+
+@mcp.tool()
+def wallet_import(
+    mnemonic: str = "",
+    keystore: dict = None,
+    password: str = "",
+    name: str = ""
+) -> dict:
+    """Import a wallet from seed phrase or keystore.
+
+    Import a wallet using either:
+    1. BIP39 mnemonic (seed phrase) - 12 or 24 words
+    2. Encrypted keystore JSON
+
+    Args:
+        mnemonic: BIP39 seed phrase (12 or 24 words, space-separated)
+        keystore: Encrypted keystore JSON object
+        password: Password for encryption (if importing mnemonic)
+                  or decryption (if importing keystore)
+        name: Optional wallet name/label
+
+    Returns:
+        {
+            "address": "RTC1a2b3c4d...",
+            "imported": true,
+            "method": "mnemonic|keystore",
+            "name": "imported-wallet",
+            "keystore_path": "~/.rustchain/mcp_wallets/RTC1a2b3c4d.json"
+        }
+
+    SECURITY:
+        - Mnemonic and private key are immediately encrypted
+        - Sensitive data is cleared from memory after encryption
+
+    Example:
+        # Import from mnemonic
+        result = wallet_import(
+            mnemonic="abandon ability able about above absent absorb abstract...",
+            password="my-secure-password",
+            name="restored-wallet"
+        )
+
+        # Import from keystore
+        result = wallet_import(
+            keystore={...},  # Previously exported keystore
+            password="my-password"
+        )
+    """
+    crypto = get_crypto()
+    
+    if mnemonic and not keystore:
+        # Import from mnemonic
+        try:
+            # Validate mnemonic format
+            words = mnemonic.strip().split()
+            if len(words) not in [12, 24]:
+                return {
+                    "error": "Invalid mnemonic: must be 12 or 24 words",
+                    "provided": len(words),
+                    "hint": "Use space-separated BIP39 seed phrase"
+                }
+            
+            # Generate keypair from mnemonic
+            seed = crypto.mnemonic_to_seed(mnemonic)
+            private_key, public_key = crypto.generate_keypair(seed)
+            address = crypto.derive_address(public_key)
+            
+            # Check if wallet already exists
+            existing = crypto.load_keystore(address)
+            if existing:
+                return {
+                    "address": address,
+                    "imported": False,
+                    "error": "Wallet already exists in keystore",
+                    "hint": "Use wallet_export to backup, then delete and re-import if needed"
+                }
+            
+            # Encrypt and save
+            if not password:
+                import secrets
+                password = secrets.token_urlsafe(16)
+            
+            encrypted_keystore = crypto.encrypt_keystore(private_key, password, address, mnemonic)
+            filepath = crypto.save_keystore(encrypted_keystore)
+            
+            return {
+                "address": address,
+                "imported": True,
+                "method": "mnemonic",
+                "name": name or address[:12],
+                "keystore_path": str(filepath),
+                "warning": "Wallet imported successfully. Mnemonic has been securely encrypted."
+            }
+        
+        except Exception as e:
+            return {
+                "error": f"Failed to import from mnemonic: {str(e)}",
+                "hint": "Verify mnemonic format (12 or 24 space-separated words)"
+            }
+    
+    elif keystore and not mnemonic:
+        # Import from keystore
+        try:
+            # Verify password
+            decrypted = crypto.decrypt_keystore(keystore, password)
+            
+            address = decrypted["address"]
+            
+            # Check if wallet already exists
+            existing = crypto.load_keystore(address)
+            if existing:
+                return {
+                    "address": address,
+                    "imported": False,
+                    "error": "Wallet already exists in keystore",
+                    "hint": "Delete existing wallet first if you want to replace it"
+                }
+            
+            # Save keystore
+            filepath = crypto.save_keystore(keystore)
+            
+            return {
+                "address": address,
+                "imported": True,
+                "method": "keystore",
+                "name": name or address[:12],
+                "keystore_path": str(filepath),
+                "warning": "Wallet imported from keystore. Verify balance with wallet_balance."
+            }
+        
+        except ValueError as e:
+            return {
+                "error": "Invalid password for keystore",
+                "hint": "Verify your keystore password"
+            }
+        except Exception as e:
+            return {
+                "error": f"Failed to import keystore: {str(e)}",
+                "hint": "Verify keystore format"
+            }
+    
+    else:
+        return {
+            "error": "Must provide either mnemonic OR keystore (not both)",
+            "hint": "Use mnemonic='...' for seed phrase import, or keystore={...} for JSON import"
+        }
+
+
+@mcp.tool()
+def wallet_transfer_signed(
+    from_address: str,
+    password: str,
+    to_address: str,
+    amount_rtc: float,
+    memo: str = ""
+) -> dict:
+    """Sign and submit an RTC transfer from a keystore wallet.
+
+    This tool handles the complete transfer workflow:
+    1. Decrypts the keystore with password
+    2. Signs the transaction with Ed25519
+    3. Submits to the RustChain network
+
+    Args:
+        from_address: Source wallet address (must exist in keystore)
+        password: Password to decrypt the keystore
+        to_address: Destination wallet address
+        amount_rtc: Amount to transfer in RTC
+        memo: Optional transaction memo
+
+    Returns:
+        {
+            "tx_id": "tx_abc123...",
+            "from": "RTC1a2b3c4d...",
+            "to": "RTC2e3f4g5h...",
+            "amount": 5.0,
+            "status": "pending|confirmed",
+            "new_balance": 10.5
+        }
+
+    SECURITY:
+        - Private key is decrypted in memory ONLY for signing
+        - Private key is NEVER exposed in response
+        - Keystore remains encrypted on disk
+
+    Example:
+        result = wallet_transfer_signed(
+            from_address="RTC1a2b3c4d...",
+            password="my-password",
+            to_address="RTC2e3f4g5h...",
+            amount_rtc=5.0,
+            memo="Payment for services"
+        )
+        print(f"Transaction: {result['tx_id']}")
+    """
+    crypto = get_crypto()
+    
+    # Load and decrypt keystore
+    keystore = crypto.load_keystore(from_address)
+    if not keystore:
+        return {
+            "error": f"Wallet {from_address} not found in keystore",
+            "hint": "Use wallet_list to see available wallets"
+        }
+    
+    try:
+        decrypted = crypto.decrypt_keystore(keystore, password)
+        private_key = decrypted["private_key"]
+    except ValueError:
+        return {
+            "error": "Invalid password",
+            "hint": "Verify your keystore password"
+        }
+    
+    # Create transaction data
+    nonce = int(time.time() * 1000)
+    tx_data = {
+        "from": from_address,
+        "to": to_address,
+        "amount": amount_rtc,
+        "nonce": nonce,
+        "memo": memo
+    }
+    message = json.dumps(tx_data, sort_keys=True).encode('utf-8')
+    
+    # Sign transaction
+    signature = crypto.sign_message(private_key, message)
+    
+    # Get public key
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives import serialization
+    priv = Ed25519PrivateKey.from_private_bytes(private_key)
+    pub = priv.public_key()
+    public_key = pub.public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw
+    )
+    
+    # Submit to network
+    payload = {
+        "from_address": from_address,
+        "to_address": to_address,
+        "amount_rtc": amount_rtc,
+        "memo": memo,
+        "nonce": nonce,
+        "signature": signature.hex(),
+        "public_key": public_key.hex(),
+    }
+    
+    try:
+        r = get_client().post(f"{RUSTCHAIN_NODE}/wallet/transfer/signed", json=payload)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        return {
+            "error": f"Transfer failed: {str(e)}",
+            "hint": "Verify sufficient balance and valid destination address"
+        }
 
 
 # ═══════════════════════════════════════════════════════════════

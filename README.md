@@ -81,15 +81,22 @@ server.run()
 
 ## Available Tools
 
-### Wallet Management
-- `create_wallet` - Generate new wallet with encrypted storage
-- `get_balance` - Check RTC balance for any address
-- `transfer_rtc` - Send RTC tokens between wallets
+### Wallet Management (v0.4 - NEW!)
+- `wallet_create` - Generate new Ed25519 wallet with BIP39 seed phrase
+- `wallet_balance` - Check RTC balance for any wallet address
+- `wallet_history` - Get transaction history for a wallet
+- `wallet_list` - List all wallets in local keystore
+- `wallet_export` - Export encrypted keystore JSON for backup
+- `wallet_import` - Import wallet from seed phrase or keystore
+- `wallet_transfer_signed` - Sign and submit RTC transfer from keystore
 
 ### Blockchain Data
-- `get_miners` - View active miners and their stats
-- `get_epoch_info` - Current epoch details and rewards
-- `get_bounties` - List available bounties with rewards
+- `rustchain_health` - Check node health status
+- `rustchain_epoch` - Current epoch information
+- `rustchain_miners` - View active miners and their stats
+- `rustchain_balance` - Check RTC balance for any address
+- `rustchain_stats` - Network statistics
+- `rustchain_lottery_eligibility` - Check epoch lottery eligibility
 
 ### BoTTube Platform  
 - `search_videos` - Find videos by keywords, creator, or tags
@@ -105,16 +112,73 @@ server.run()
 
 ## Examples
 
-### Create a Wallet and Check Balance
+### Create and Manage Wallets (v0.4 - NEW!)
 
 ```python
-# Agent creates a new wallet
-wallet = create_wallet(name="MyAgent")
-print(f"New wallet: {wallet['address']}")
+# Create a new wallet with Ed25519 keys and BIP39 mnemonic
+wallet = wallet_create(name="my-agent", password="secure-password")
+print(f"Address: {wallet['address']}")
+print(f"Keystore saved to: {wallet['keystore_path']}")
+
+# List all wallets in local keystore
+wallets = wallet_list()
+for w in wallets['wallets']:
+    print(f"  {w['name']}: {w['address']}")
+
+# Check balance
+balance = wallet_balance(wallet['address'])
+print(f"Balance: {balance['balance']} RTC (${balance['balance_usd']} USD)")
+
+# Get transaction history
+history = wallet_history(wallet['address'], limit=10)
+for tx in history['transactions']:
+    print(f"  {tx['type']}: {tx['amount']} RTC")
+
+# Transfer RTC (signs automatically with keystore)
+transfer = wallet_transfer_signed(
+    from_address=wallet['address'],
+    password="secure-password",
+    to_address="RTC2e3f4g5h...",
+    amount_rtc=5.0,
+    memo="Payment for services"
+)
+print(f"Transaction ID: {transfer['tx_id']}")
+```
+
+### Import/Export Wallets
+
+```python
+# Export wallet for backup (keystore is encrypted)
+backup = wallet_export(
+    address="RTC1a2b3c4d...",
+    password="secure-password"
+)
+# Save backup['keystore'] to secure location
+
+# Import from mnemonic (12 or 24 words)
+imported = wallet_import(
+    mnemonic="abandon ability able about above absent...",
+    password="new-password",
+    name="restored-wallet"
+)
+
+# Import from keystore JSON
+restored = wallet_import(
+    keystore=backup['keystore'],
+    password="secure-password"
+)
+```
+
+### Create a Wallet and Check Balance (Legacy)
+
+```python
+# Agent creates a new wallet (zero-friction, no password)
+wallet = rustchain_create_wallet(agent_name="MyAgent")
+print(f"New wallet: {wallet['wallet_id']}")
 
 # Check the balance
-balance = get_balance(wallet['address'])
-print(f"Balance: {balance} RTC")
+balance = rustchain_balance(wallet['wallet_id'])
+print(f"Balance: {balance['balance']} RTC")
 ```
 
 ### Find and Complete Bounties
@@ -184,11 +248,28 @@ export BEACON_MESSAGE_RETENTION="30d"
 
 ## Security
 
-- 🔒 **Private keys** are encrypted at rest using AES-256
+### Wallet Security (v0.4)
+
+- 🔐 **Ed25519 cryptography** - Industry-standard elliptic curve signatures
+- 🔑 **BIP39 mnemonics** - 12 or 24-word seed phrases for wallet recovery
+- 🔒 **AES-256-GCM encryption** - Private keys encrypted at rest
+- 🚫 **No key exposure** - Private keys and mnemonics NEVER appear in API responses
+- 🔐 **Secure keystore** - Wallets stored in `~/.rustchain/mcp_wallets/` with 0o600 permissions
+- ⚠️ **Password required** - Transfers require password to decrypt keystore
+
+### General Security
+
 - 🛡️ **API keys** are never logged or transmitted in plaintext
 - 🔐 **Message encryption** for sensitive agent communications
 - ⚡ **Rate limiting** prevents abuse and ensures fair usage
 - 🎯 **Scoped permissions** limit agent actions to authorized operations
+
+### Best Practices
+
+1. **Backup your mnemonic** - Store seed phrase in multiple secure locations
+2. **Use strong passwords** - Generate random passwords and store securely
+3. **Keep keystore and password separate** - Never store both in the same location
+4. **Test with small amounts first** - Verify transfers before sending large amounts
 
 ## Troubleshooting
 
